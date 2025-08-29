@@ -1,124 +1,96 @@
-import os
-import getpass
-import pickle
+import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
+import os
 from datetime import datetime
-from flask import Flask, render_template, request, send_file
 from garminconnect import Garmin
-
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, mean_absolute_error
+import joblib
+from tqdm import tqdm
 
+st.title("Análisis Garmin: Modelo de Ritmo por Lap")
 
-# -----------------------
-# Funciones auxiliares
-# -----------------------
+# ----------------------------
+# Paso 1: Credenciales
+# ----------------------------
+usuario = st.text_input("Usuario Garmin")
+password = st.text_input("Contraseña Garmin", type="password")
 
-def extraer_datos(api, dias):
-    """Descarga actividades y construye dataframe de laps"""
-    actividades = api.get_activities(0, 1200)
-    df = pd.DataFrame(actividades)
+if st.button("Conectar y Procesar"):
 
-    # Filtro temporal
-    df["startTimeLocal"] = pd.to_datetime(df["startTimeLocal"])
-    fecha_max = df["startTimeLocal"].max()
-    fecha_min = fecha_max - pd.Timedelta(days=dias)
-    df_filtrado = df[df["startTimeLocal"] >= fecha_min].copy()
-
-    if df_filtrado.empty:
-        return pd.DataFrame(), 0
-
-    # Ejemplo simple: usar distancias y tiempos
-    df_filtrado["activityId"] = df_filtrado["activityId"].astype(str)
-    df_filtrado["dist_cum"] = df_filtrado["distance"]  # metros
-    df_filtrado["dur_min_cum"] = df_filtrado["duration"] / 60  # minutos
-    df_filtrado["ritmo_lap"] = df_filtrado["duration"] / df_filtrado["distance"]
-
-    return df_filtrado, df_filtrado["activityId"].nunique()
-
-
-def entrenar_modelo(df):
-    """Entrena regresión lineal"""
-    X = df[["dist_cum", "dur_min_cum"]]
-    y = df["ritmo_lap"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    model = LinearRegression()
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    return model, r2
-
-
-# -----------------------
-# Flask
-# -----------------------
-app = Flask(__name__)
-mejor_modelo = None
-mejor_r2 = -999
-archivo_modelo = None
-
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    global mejor_modelo, mejor_r2, archivo_modelo
-
-    if request.method == "POST":
-        usuario = request.form["usuario"]
-        password = request.form["password"]
-
-        # Autenticación Garmin
+    if not usuario or not password:
+        st.error("Debe ingresar usuario y contraseña.")
+    else:
         try:
             api = Garmin(usuario, password)
             api.login()
+            st.success("✅ Conexión exitosa a Garmin Connect")
         except Exception as e:
-            return f"❌ Error en login Garmin: {e}"
+            st.error(f"Error en login Garmin: {e}")
+            st.stop()
 
-        # Rango de días a evaluar
-        dias_range = [30, 60, 90, 180]
-        min_actividades = 20
-        mejor_modelo, mejor_r2 = None, -999
+        # ----------------------------
+        # Paso 2: Descargar actividades
+        # ----------------------------
+        actividades = api.get_activities(0, 1200)
+        df_act = pd.DataFrame(actividades)
+        st.write(f"Se descargaron {len(df_act)} actividades.")
 
-        for dias in dias_range:
-            df_laps, n_actividades = extraer_datos(api, dias)
-            if n_actividades < min_actividades:
-                continue
+        # ----------------------------
+        # Paso 3: Funciones de tu código
+        # ----------------------------
+        def extraer_datos(metros, cantidad_dias):
+            df_act["startTimeLocal"] = pd.to_datetime(df_act["startTimeLocal"])
+            df_filtrado = df_act[df_act["distance"] > metros].copy()
+            hoy = pd.Timestamp.today()
+            df_filtrado = df_filtrado[(hoy - df_filtrado["startTimeLocal"]).dt.days <= cantidad_dias].copy()
 
-            modelo, r2 = entrenar_modelo(df_laps)
+            laps_data = []
+            for _, act in tqdm(df_filtrado.iterrows(), total=len(df_filtrado)):
+                activity_id = act["activityId"]
+                days_since_first = (act["startTimeLocal"] - df_act["startTimeLocal"].min()).days
+                laps = api.get_activity_splits(activity_id)
 
-            if r2 > mejor_r2:
-                mejor_modelo = modelo
-                mejor_r2 = r2
+                if "lapDTOs" in laps:
+                    for lap in laps["lapDTOs"]:
+                        dist_km = lap.get("distance", 0) / 1000
+                        dur_min = lap.get("duration", 0) / 60
+                        gain = lap.get("elevationGain", 0)
+                        loss = lap.get("elevationLoss", 0)
 
-        if mejor_modelo is None:
-            return "❌ No se encontró un modelo válido (pocas actividades)."
+                        if dist_km > 0:
+                            laps_data.append({
+                                "activityId": activity_id,
+                                "lapNumber": lap.get("lapIndex"),
+                                "dist_km": dist_km,
+                                "dur_min": dur_min,
+                                "ritmo_lap": dur_min / dist_km,
+                                "alt_gain": gain,
+                                "alt_loss": loss,
+                                "pendiente_media": (gain - loss) / dist_km,
+                                "days_since_first": days_since_first
+                            })
 
-        # Guardar modelo en archivo
-        fecha = datetime.now().strftime("%d%m%Y")
-        archivo_modelo = f"{usuario}_{fecha}.pkl"
-        with open(archivo_modelo, "wb") as f:
-            pickle.dump(mejor_modelo, f)
+            df_laps = pd.DataFrame(laps_data)
+            df_laps = df_laps.sort_values(["activityId", "lapNumber"])
+            df_laps["alt_gain_cum"] = df_laps.groupby("activityId")["alt_gain"].cumsum()
+            df_laps["alt_loss_cum"] = df_laps.groupby("activityId")["alt_loss"].cumsum()
+            df_laps["dist_cum"] = df_laps.groupby("activityId")["dist_km"].cumsum()
+            df_laps["dur_min_cum"] = df_laps.groupby("activityId")["dur_min"].cumsum()
+            return df_laps, df_filtrado["startTimeLocal"].min()
 
-        return render_template("resultado.html", r2=mejor_r2, archivo=archivo_modelo)
-
-    return render_template("index.html")
-
-
-@app.route("/download")
-def download():
-    global archivo_modelo
-    if archivo_modelo and os.path.exists(archivo_modelo):
-        return send_file(archivo_modelo, as_attachment=True)
-    return "❌ No hay modelo disponible para descargar."
-
-
-# -----------------------
-# Run
-# -----------------------
-if __name__ == "__main__":
-    app.run(debug=True)
+        def regresion_lineal(df_laps):
+            X = df_laps[[
+                "lapNumber", "dist_cum", "alt_gain_cum", "alt_loss_cum",
+                "alt_loss", "alt_gain", "dur_min_cum", "days_since_first"
+            ]]
+            y = df_laps["ritmo_lap"]
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            model = LinearRegression()
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            st.write(f"R²: {r2:.
