@@ -93,4 +93,67 @@ if st.button("Conectar y Procesar"):
             y_pred = model.predict(X_test)
             r2 = r2_score(y_test, y_pred)
             mae = mean_absolute_error(y_test, y_pred)
-            st.write(f"R²: {r2:.
+            st.write(f"R²: {r2:.3f} | MAE: {mae:.3f}")
+            return model
+
+        def test_r2_por_antiguedad(metros, dias_range, min_actividades=20):
+            r2_list, laps_list, dias_validos, actividades_list = [], [], [], []
+            mejor_modelo, mejor_r2 = None, -999
+
+            for dias in dias_range:
+                df_laps, _ = extraer_datos(metros, dias)
+                n_actividades = df_laps["activityId"].nunique()
+                if n_actividades < min_actividades:
+                    continue
+                model = regresion_lineal(df_laps)
+                X = df_laps[[
+                    "lapNumber", "dist_cum", "alt_gain_cum", "alt_loss_cum",
+                    "alt_loss", "alt_gain", "dur_min_cum", "days_since_first"
+                ]]
+                y = df_laps["ritmo_lap"]
+                _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                y_pred = model.predict(X_test)
+                r2 = r2_score(y_test, y_pred)
+                dias_validos.append(dias)
+                r2_list.append(r2)
+                laps_list.append(len(df_laps))
+                actividades_list.append(n_actividades)
+                if r2 > mejor_r2:
+                    mejor_r2 = r2
+                    mejor_modelo = model
+
+            return dias_validos, r2_list, laps_list, actividades_list, mejor_modelo, mejor_r2
+
+        # ----------------------------
+        # Paso 4: Ejecutar análisis
+        # ----------------------------
+        dias_range = list(range(100, 500, 30))
+        metros = 20000
+        dias_validos, r2_list, laps_list, actividades_list, mejor_modelo, mejor_r2 = test_r2_por_antiguedad(metros, dias_range)
+        st.write(f"Mejor R²: {mejor_r2:.3f}")
+
+        # ----------------------------
+        # Paso 5: Gráfico
+        # ----------------------------
+        fig, ax1 = plt.subplots(figsize=(9,5))
+        ax1.plot(dias_validos, r2_list, marker='o', color="tab:blue", label="R²")
+        ax1.set_xlabel("Antigüedad máxima (días)")
+        ax1.set_ylabel("R²", color="tab:blue")
+        ax1.grid(True, linestyle="--", alpha=0.5)
+        ax2 = ax1.twinx()
+        ax2.plot(dias_validos, laps_list, marker='s', color="tab:green", label="Laps usados")
+        ax2.plot(dias_validos, actividades_list, marker='^', color="tab:red", label="Actividades")
+        ax2.set_ylabel("Cantidad de laps / actividades", color="tab:green")
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="best")
+        st.pyplot(fig)
+
+        # ----------------------------
+        # Paso 6: Guardar y descargar modelo
+        # ----------------------------
+        fecha = datetime.now().strftime("%d%m%Y")
+        nombre_archivo = f"{usuario}_{fecha}_mejor_modelo.pkl"
+        joblib.dump(mejor_modelo, nombre_archivo)
+        st.success(f"✅ Modelo guardado: {nombre_archivo}")
+        st.download_button("📥 Descargar modelo", data=open(nombre_archivo, "rb"), file_name=nombre_archivo)
